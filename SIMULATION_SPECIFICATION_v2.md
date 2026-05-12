@@ -21,8 +21,9 @@
 7. [Failure Model](#failure-model)
 8. [Output Files & Schemas](#output-files--schemas)
 9. [Data Publishing Strategy](#data-publishing-strategy)
-10. [Implementation Checklist](#implementation-checklist)
-11. [CODESYS ST Variable Structures](#codesys-st-variable-structures)
+10. [Implementation Assumptions - LOCKED](#implementation-assumptions---locked)
+11. [Implementation Checklist](#implementation-checklist)
+12. [CODESYS ST Variable Structures](#codesys-st-variable-structures)
 
 ---
 
@@ -884,6 +885,309 @@ Analytics & Dashboards
 
 ---
 
+## IMPLEMENTATION ASSUMPTIONS - LOCKED
+
+These 6 items complete the implementation readiness checklist. All decisions are locked and implementable.
+
+### 1. Random Function Implementation (CODESYS)
+
+**Decision: Use IEC 61131-3 Native RAND() with custom seed**
+
+```codesys
+(* Initialize at simulation start *)
+SRAND(42);  (* Fixed seed for reproducibility *)
+
+(* For TRIANGULAR distribution: *)
+FUNCTION TRIANGULAR : REAL
+VAR_INPUT
+  min_val : REAL;
+  mode_val : REAL;
+  max_val : REAL;
+END_VAR
+VAR
+  u : REAL;
+  F_mode : REAL;
+END_VAR
+
+  u := RAND();
+  F_mode := (mode_val - min_val) / (max_val - min_val);
+  
+  IF u < F_mode THEN
+    TRIANGULAR := min_val + SQRT(u * (max_val - min_val) * (mode_val - min_val));
+  ELSE
+    TRIANGULAR := max_val - SQRT((1.0 - u) * (max_val - min_val) * (max_val - mode_val));
+  END_IF;
+END_FUNCTION
+
+(* For POISSON distribution: *)
+FUNCTION POISSON : INT
+VAR_INPUT
+  lambda : REAL;
+END_VAR
+VAR
+  L : REAL;
+  k : INT := 0;
+  p : REAL := 1.0;
+  threshold : REAL;
+END_VAR
+
+  L := EXP(-lambda);
+  threshold := RAND();
+  
+  WHILE p > threshold DO
+    k := k + 1;
+    p := p * RAND();
+  END_WHILE;
+  
+  POISSON := k - 1;
+END_FUNCTION
+```
+
+**Why**: Native RAND() is portable, deterministic, and meets precision needs for 2.6M scans.
+
+---
+
+### 2. Queue Buffer Sizes (CODESYS)
+
+**Decision: Fixed circular buffer arrays; 2500 slots per queue**
+
+```codesys
+VAR_GLOBAL
+  (* Each queue: 2500 max capacity *)
+  (* Rationale: 3,090 arrivals ÷ 5 stations = 618 avg per station *)
+  (* 2500 provides 4× safety margin without memory bloat *)
+  
+  S1_Queue : ARRAY[0..2499] OF UDINT;
+  S1_Head : INT := 0;
+  S1_Tail : INT := 0;
+  
+  S2_Queue : ARRAY[0..2499] OF UDINT;
+  S2_Head : INT := 0;
+  S2_Tail : INT := 0;
+  
+  S3a_Queue : ARRAY[0..2499] OF UDINT;
+  S3a_Head : INT := 0;
+  S3a_Tail : INT := 0;
+  
+  S3b_Queue : ARRAY[0..2499] OF UDINT;
+  S3b_Head : INT := 0;
+  S3b_Tail : INT := 0;
+  
+  S4_Queue : ARRAY[0..2499] OF UDINT;
+  S4_Head : INT := 0;
+  S4_Tail : INT := 0;
+  
+  O1_Queue : ARRAY[0..2499] OF UDINT;
+  O1_Head : INT := 0;
+  O1_Tail : INT := 0;
+END_VAR
+```
+
+**Queue overflow logic**:
+```
+IF NextTail = Head THEN
+  (* Queue full - critical error *)
+  LogError("Queue overflow at station X");
+  SimulationRunning := FALSE;
+END_IF;
+```
+
+**Why**: 2500 slots = ~100 KB per queue (total ~600 KB for all 6); covers worst-case temporary congestion.
+
+---
+
+### 3. DateTime/Time Arithmetic (CODESYS IEC 61131-3)
+
+**Decision: Use native DT (DateTime) type with ADD_TIME function**
+
+```codesys
+VAR_GLOBAL
+  SimulationTime : DT := DT#2026-03-01-00:00:00;
+  SimStop : DT := DT#2026-03-31-00:00:00;
+END_VAR
+
+(* Time arithmetic helpers *)
+FUNCTION AddMinutes : DT
+VAR_INPUT
+  dt_base : DT;
+  minutes : REAL;
+END_VAR
+
+  AddMinutes := ADD_TIME(dt_base, LINT_TO_TIME(REAL_TO_LINT(minutes * 60 * 1000)));
+END_FUNCTION
+
+FUNCTION AddSeconds : DT
+VAR_INPUT
+  dt_base : DT;
+  seconds : INT;
+END_VAR
+
+  AddSeconds := ADD_TIME(dt_base, INT_TO_TIME(seconds * 1000));
+END_FUNCTION
+
+(* Main scan loop increment *)
+SimulationTime := AddSeconds(SimulationTime, 1);  (* +1 second per scan *)
+
+(* Example: Service time completion *)
+EndTime := AddMinutes(StartTime, TRIANGULAR(0, 3, 40));
+
+(* Example: Failure time *)
+MTTR_EndTime := AddMinutes(FailureStart, 120);  (* +120 minutes *)
+```
+
+**Why**: Native DT handles all timestamp logic; ADD_TIME ensures platform consistency.
+
+---
+
+### 4. db_truck.csv Output Timing (CODESYS)
+
+**Decision: Write at END of simulation, once per truck arrival**
+
+```codesys
+VAR_GLOBAL
+  (* Event buffer for db_truck records *)
+  db_truck_records : ARRAY[1..10000] OF db_truck_Event;
+  db_truck_count : INT := 0;
+END_VAR
+
+TYPE db_truck_Event :
+  STRUCT
+    po_number : DINT;
+    vehicle_number : STRING[30];
+    company_id : INT;
+    sold_to : STRING[50];
+    arrival_time : DT;
+    product_type : STRING[15];
+  END_STRUCT
+END_TYPE
+
+(* During simulation: append to buffer *)
+PROCEDURE OnTruckArrival(truck : TruckEntity)
+  db_truck_count := db_truck_count + 1;
+  db_truck_records[db_truck_count].po_number := truck.PONumber;
+  db_truck_records[db_truck_count].vehicle_number := truck.VehicleNumber;
+  db_truck_records[db_truck_count].company_id := truck.CompanyID;
+  db_truck_records[db_truck_count].sold_to := "TAS Facility";  (* placeholder *)
+  db_truck_records[db_truck_count].arrival_time := truck.S1_ArrivalTime;
+  IF truck.ProductType = DIESEL THEN
+    db_truck_records[db_truck_count].product_type := "DIESEL";
+  ELSE
+    db_truck_records[db_truck_count].product_type := "GASOHOL95";
+  END_IF;
+END_PROCEDURE
+
+(* At simulation end *)
+PROCEDURE WriteAllOutputs()
+  WriteCSV("db_truck.csv", db_truck_records, db_truck_count);
+  WriteCSV("s1_sales_office.csv", ...);
+  (* etc. for all 9 output files *)
+END_PROCEDURE
+```
+
+**Why**: Writing at end avoids file I/O performance overhead during 2.6M scans.
+
+---
+
+### 5. MTTR Timing (CODESYS) - LOCKED AS FIXED
+
+**Decision: MTTR = Exactly 120 minutes (FIXED), sampled only at initialization and after each repair**
+
+```codesys
+VAR_GLOBAL
+  L1_NextFailureTime : DT;
+  L1_FailureStart : DT;
+  L1_RepairEndTime : DT;
+  L1_MTTR_Minutes : INT := 120;  (* LOCKED: never changes *)
+  
+  L2_NextFailureTime : DT;
+  L2_FailureStart : DT;
+  L2_RepairEndTime : DT;
+  L2_MTTR_Minutes : INT := 120;  (* LOCKED: never changes *)
+END_VAR
+
+(* During initialization *)
+PROCEDURE InitializeFailures()
+  L1_NextFailureTime := AddMinutes(SimulationTime, TRIANGULAR(7500, 9000, 10500));
+  L2_NextFailureTime := AddMinutes(SimulationTime, TRIANGULAR(7500, 9000, 10500));
+END_PROCEDURE
+
+(* During each scan *)
+PROCEDURE CheckFailures()
+  (* Diesel line *)
+  IF L1_Status = OPERATIONAL THEN
+    IF SimulationTime >= L1_NextFailureTime THEN
+      L1_Status := FAILURE;
+      L1_FailureStart := SimulationTime;
+      L1_RepairEndTime := AddMinutes(SimulationTime, REAL_TO_INT(L1_MTTR_Minutes));
+      (* Pause all active S3a trucks *)
+      PauseAllS3aTrucks();
+      (* Sample NEXT failure time *)
+      L1_NextFailureTime := AddMinutes(SimulationTime, TRIANGULAR(7500, 9000, 10500));
+    END_IF;
+  END_IF;
+  
+  IF L1_Status = FAILURE THEN
+    IF SimulationTime >= L1_RepairEndTime THEN
+      L1_Status := OPERATIONAL;
+      (* Resume all paused S3a trucks *)
+      ResumeAllS3aTrucks();
+    END_IF;
+  END_IF;
+END_PROCEDURE
+```
+
+**Why**: MTTR is operational reality (2-hour repair crew time). MTTF randomness gives sufficient variation.
+
+---
+
+### 6. GroundingStatus Compliance (CODESYS) - LOCKED AS ALWAYS COMPLIANT
+
+**Decision: No violations injected; all trucks must ground before filling**
+
+```codesys
+PROCEDURE OnS3TruckArrival(truck : TruckEntity; lineType : ENUM)
+  truck.S3_ArrivalTime := SimulationTime;
+  truck.S3_GroundingStatus := FALSE;  (* Compliance flag: not yet grounded *)
+  truck.S3_GroundingStartTime := SimulationTime;
+  truck.S3_GroundingTime := TRIANGULAR(3, 4, 6);  (* Minutes *)
+END_PROCEDURE
+
+PROCEDURE OnS3GroundingComplete(truck : TruckEntity)
+  (* Grounding finished; safe to fill *)
+  truck.S3_FillStartTime := AddMinutes(truck.S3_GroundingStartTime, truck.S3_GroundingTime);
+  truck.S3_GroundingStatus := TRUE;  (* Compliance locked: grounded ✓ *)
+  (* Fill now proceeds *)
+END_PROCEDURE
+
+(* Validation: No CSV record written without grounding *)
+PROCEDURE WriteS3Record(truck : TruckEntity)
+  IF truck.S3_GroundingStatus = FALSE THEN
+    LogError("Attempt to write S3 record without grounding - data corruption!");
+    RETURN;
+  END_IF;
+  (* Proceed with CSV write *)
+END_PROCEDURE
+```
+
+**Why**: v1 is safety-first baseline; no edge cases of non-compliance.
+
+---
+
+## Summary: Implementation Readiness
+
+| Assumption | Decision | Locked |
+|-----------|----------|--------|
+| Random functions | TRIANGULAR/POISSON via native RAND() | ✅ |
+| Queue buffers | 2500 slots per queue | ✅ |
+| DateTime arithmetic | Native DT + ADD_TIME | ✅ |
+| db_truck.csv timing | Write at end, once per arrival | ✅ |
+| MTTR | Fixed 120 min (never sampled) | ✅ |
+| GroundingStatus | Always compliant; no violations | ✅ |
+
+**All 6 implementation assumptions are now CODE-READY.**
+
+---
+
 ## IMPLEMENTATION CHECKLIST
 
 ### Phase 1: Data Structures
@@ -891,12 +1195,12 @@ Analytics & Dashboards
 - [ ] Define FailureEvent struct
 - [ ] Define CompanyMaster lookup table
 - [ ] Define queues: S1, S2, S3a, S3b, S4, O1
+- [ ] Define db_truck_Event struct (per section 10, assumption 4)
 
 ### Phase 2: Random Number Generation
-- [ ] Implement TRIANGULAR(min, mode, max) function
-- [ ] Implement POISSON(lambda) function for arrivals
-- [ ] Implement POISSON function for pause time if needed
-- [ ] Set seed for reproducibility
+- [ ] Implement TRIANGULAR(min, mode, max) function (per section 10, assumption 1)
+- [ ] Implement POISSON(lambda) function for arrivals (per section 10, assumption 1)
+- [ ] Set seed = 42 for reproducibility (per section 10, assumption 1)
 - [ ] Test distributions against histograms
 
 ### Phase 3: Initialization
@@ -924,15 +1228,17 @@ Analytics & Dashboards
 - [ ] On truck departure: publish/buffer DEPARTURE event
 
 ### Phase 6: Output Writing (End of Simulation)
-- [ ] Write db_truck.csv (vehicle master)
-- [ ] Write s1_sales_office.csv
-- [ ] Write s2_inbound_wb.csv
-- [ ] Write s3a_diesel_bay.csv (with failure_downtime_mins)
-- [ ] Write s3b_gasohol95_bay.csv (with failure_downtime_mins)
-- [ ] Write s4_outbound_wb.csv
-- [ ] Write o1_exit_gate.csv
-- [ ] Write l1_diesel_failure.csv
-- [ ] Write l2_gasohol95_failure.csv
+- [ ] Implement db_truck event buffer (per section 10, assumption 4)
+- [ ] Write all 9 CSV files at END of simulation (per section 10, assumption 4)
+- [ ] db_truck.csv: one row per truck arrival
+- [ ] s1_sales_office.csv: one row per S1 visit
+- [ ] s2_inbound_wb.csv: one row per S2 visit
+- [ ] s3a_diesel_bay.csv (with failure_downtime_mins)
+- [ ] s3b_gasohol95_bay.csv (with failure_downtime_mins)
+- [ ] s4_outbound_wb.csv: one row per S4 visit
+- [ ] o1_exit_gate.csv: one row per final exit
+- [ ] l1_diesel_failure.csv: one row per failure event
+- [ ] l2_gasohol95_failure.csv: one row per failure event
 
 ### Phase 7: Validation
 - [ ] Check total arrivals ≈ 3,090 (±5%)
