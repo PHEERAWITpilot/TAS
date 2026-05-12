@@ -625,42 +625,66 @@ every scan:
 
 ---
 
-## FAILURE MODEL (LINE-LEVEL, RANDOM MTTF)
+## FAILURE MODEL (LINE-LEVEL, ACCUMULATED FILL TIME)
 
-### Failure Generation
+### Failure Generation - CORRECTED: Trigger on Accumulated Fill Time, Not Wall-Clock
 
 **Per line (L1 diesel, L2 gasohol95)**:
 
+**CRITICAL**: Failures accumulate only during active filling, not wall-clock time.
+
 ```
 L1_Status := OPERATIONAL
-L1_NextFailureTime := now + TRIANGULAR(7500, 9000, 10500)
+L1_FailureThresholdMinutes := TRIANGULAR(7500, 9000, 10500)  // sampled at init and after repair
+L1_AccumulatedFillMinutes := 0  // counts only active filling
 
 L2_Status := OPERATIONAL
-L2_NextFailureTime := now + TRIANGULAR(7500, 9000, 10500)
+L2_FailureThresholdMinutes := TRIANGULAR(7500, 9000, 10500)
+L2_AccumulatedFillMinutes := 0
 
 // Each scan:
 FOR each line in {L1, L2}:
-  if line_Status == OPERATIONAL:
-    if now >= line_NextFailureTime:
+  
+  (* Accumulate fill time only if operational and active *)
+  IF line_Status == OPERATIONAL THEN
+    IF HasActiveFillInProgress(line) THEN
+      line_AccumulatedFillMinutes := line_AccumulatedFillMinutes + (1 second / 60)  // add 1/60 min per scan
+    END_IF;
+    
+    (* Check if failure threshold reached *)
+    IF line_AccumulatedFillMinutes >= line_FailureThresholdMinutes THEN
       line_Status := FAILURE
       FailureStart := now
-      RepairEndTime := now + 120
-      line_NextFailureTime := now + TRIANGULAR(7500, 9000, 10500)
+      RepairEndTime := now + 120 minutes
+      line_NextFailureTime := sample TRIANGULAR(7500, 9000, 10500)  // sample NEXT threshold
+      line_AccumulatedFillMinutes := 0  // reset accumulator
       FindAllActiveFillingTrucks(line)
       for each truck:
         truck.IsFailurePaused := TRUE
         truck.FailurePauseStart := now
+    END_IF;
+  END_IF;
   
-  if line_Status == FAILURE:
-    if now >= RepairEndTime:
+  (* Repair timeout *)
+  IF line_Status == FAILURE THEN
+    IF now >= RepairEndTime THEN
       line_Status := OPERATIONAL
       for each paused truck:
         truck.IsFailurePaused := FALSE
         truck.FailurePauseEnd := now
-        truck.FailureDowntimeMinutes += (FailurePauseEnd - FailurePauseStart)
+        truck.FailureDowntimeMinutes += (truck.FailurePauseEnd - truck.FailurePauseStart)
+    END_IF;
+  END_IF;
+END_FOR
 ```
 
-### Failure Effects (LINE-LEVEL)
+**Key difference from wall-clock**:
+- Old: Failure @ `now >= NextFailureTime` (triggers during idle)
+- New: Failure @ `AccumulatedFillMinutes >= Threshold` (triggers only during active filling)
+
+---
+
+### Failure Effects (LINE-LEVEL, FILL-TIME BASED)
 
 **When L1 (Diesel) fails**:
 - All trucks currently in S3a FILLING state pause
@@ -1088,18 +1112,26 @@ END_PROCEDURE
 
 ---
 
-### 5. MTTR Timing (CODESYS) - LOCKED AS FIXED
+### 5. MTTR & Failure Timing (CODESYS) - FILL-TIME ACCUMULATED
 
-**Decision: MTTR = Exactly 120 minutes (FIXED), sampled only at initialization and after each repair**
+**Decision: MTTR = Exactly 120 minutes (FIXED); MTTF accumulates only during active filling**
+
+**CRITICAL CORRECTION**: Failures trigger on **accumulated fill time**, not wall-clock time.
 
 ```codesys
 VAR_GLOBAL
-  L1_NextFailureTime : DT;
+  (* Diesel line (L1) *)
+  L1_Status : (OPERATIONAL, FAILURE);
+  L1_FailureThresholdMinutes : REAL;  (* sampled TRIANGULAR after each repair *)
+  L1_AccumulatedFillMinutes : REAL := 0.0;  (* counts ONLY active filling *)
   L1_FailureStart : DT;
   L1_RepairEndTime : DT;
   L1_MTTR_Minutes : INT := 120;  (* LOCKED: never changes *)
   
-  L2_NextFailureTime : DT;
+  (* Gasohol line (L2) *)
+  L2_Status : (OPERATIONAL, FAILURE);
+  L2_FailureThresholdMinutes : REAL;  (* sampled TRIANGULAR after each repair *)
+  L2_AccumulatedFillMinutes : REAL := 0.0;  (* counts ONLY active filling *)
   L2_FailureStart : DT;
   L2_RepairEndTime : DT;
   L2_MTTR_Minutes : INT := 120;  (* LOCKED: never changes *)
@@ -1107,36 +1139,93 @@ END_VAR
 
 (* During initialization *)
 PROCEDURE InitializeFailures()
-  L1_NextFailureTime := AddMinutes(SimulationTime, TRIANGULAR(7500, 9000, 10500));
-  L2_NextFailureTime := AddMinutes(SimulationTime, TRIANGULAR(7500, 9000, 10500));
+  L1_FailureThresholdMinutes := TRIANGULAR(7500, 9000, 10500);
+  L2_FailureThresholdMinutes := TRIANGULAR(7500, 9000, 10500);
+  L1_AccumulatedFillMinutes := 0.0;
+  L2_AccumulatedFillMinutes := 0.0;
 END_PROCEDURE
 
-(* During each scan *)
+(* During each scan - FILL-TIME ACCUMULATION *)
 PROCEDURE CheckFailures()
-  (* Diesel line *)
+  (* Diesel line (L1) *)
   IF L1_Status = OPERATIONAL THEN
-    IF SimulationTime >= L1_NextFailureTime THEN
+    (* Accumulate fill time only if active fills exist *)
+    IF HasActiveS3aFills() THEN
+      L1_AccumulatedFillMinutes := L1_AccumulatedFillMinutes + (1.0 / 60.0);  (* +1 sec = 1/60 min *)
+    END_IF;
+    
+    (* Trigger failure if threshold reached *)
+    IF L1_AccumulatedFillMinutes >= L1_FailureThresholdMinutes THEN
       L1_Status := FAILURE;
       L1_FailureStart := SimulationTime;
       L1_RepairEndTime := AddMinutes(SimulationTime, REAL_TO_INT(L1_MTTR_Minutes));
-      (* Pause all active S3a trucks *)
       PauseAllS3aTrucks();
-      (* Sample NEXT failure time *)
-      L1_NextFailureTime := AddMinutes(SimulationTime, TRIANGULAR(7500, 9000, 10500));
+      (* Sample NEXT failure threshold *)
+      L1_FailureThresholdMinutes := TRIANGULAR(7500, 9000, 10500);
+      L1_AccumulatedFillMinutes := 0.0;  (* Reset accumulator *)
     END_IF;
   END_IF;
   
+  (* Repair timeout *)
   IF L1_Status = FAILURE THEN
     IF SimulationTime >= L1_RepairEndTime THEN
       L1_Status := OPERATIONAL;
-      (* Resume all paused S3a trucks *)
       ResumeAllS3aTrucks();
     END_IF;
   END_IF;
+  
+  (* Same logic for Gasohol line (L2) *)
+  IF L2_Status = OPERATIONAL THEN
+    IF HasActiveS3bFills() THEN
+      L2_AccumulatedFillMinutes := L2_AccumulatedFillMinutes + (1.0 / 60.0);
+    END_IF;
+    
+    IF L2_AccumulatedFillMinutes >= L2_FailureThresholdMinutes THEN
+      L2_Status := FAILURE;
+      L2_FailureStart := SimulationTime;
+      L2_RepairEndTime := AddMinutes(SimulationTime, REAL_TO_INT(L2_MTTR_Minutes));
+      PauseAllS3bTrucks();
+      L2_FailureThresholdMinutes := TRIANGULAR(7500, 9000, 10500);
+      L2_AccumulatedFillMinutes := 0.0;
+    END_IF;
+  END_IF;
+  
+  IF L2_Status = FAILURE THEN
+    IF SimulationTime >= L2_RepairEndTime THEN
+      L2_Status := OPERATIONAL;
+      ResumeAllS3bTrucks();
+    END_IF;
+  END_IF;
 END_PROCEDURE
+
+(* Helper: Check if S3a has active fills *)
+FUNCTION HasActiveS3aFills : BOOL
+VAR
+  bay_idx : INT;
+END_VAR
+  FOR bay_idx := 0 TO 3 DO
+    IF S3a_BayOccupied[bay_idx] THEN
+      RETURN TRUE;
+    END_IF;
+  END_FOR;
+  HasActiveS3aFills := FALSE;
+END_FUNCTION
+
+(* Helper: Check if S3b has active fills *)
+FUNCTION HasActiveS3bFills : BOOL
+VAR
+  bay_idx : INT;
+END_VAR
+  FOR bay_idx := 0 TO 1 DO
+    IF S3b_BayOccupied[bay_idx] THEN
+      RETURN TRUE;
+    END_IF;
+  END_FOR;
+  HasActiveS3bFills := FALSE;
+END_FUNCTION
 ```
 
-**Why**: MTTR is operational reality (2-hour repair crew time). MTTF randomness gives sufficient variation.
+**Why**: Failures occur due to equipment stress during active filling, not idle time. This matches operational reality and avoids unexpected downtime during quiet periods.
 
 ---
 
@@ -1183,6 +1272,7 @@ END_PROCEDURE
 | db_truck.csv timing | Write at end, once per arrival | ✅ |
 | MTTR | Fixed 120 min (never sampled) | ✅ |
 | GroundingStatus | Always compliant; no violations | ✅ |
+| **Failure timing** | **Accumulated fill time only (not wall-clock)** | **✅** |
 
 **All 6 implementation assumptions are now CODE-READY.**
 
@@ -1422,7 +1512,8 @@ VAR_GLOBAL
   
   (* Failure States *)
   L1_Status             : (OPERATIONAL, FAILURE);
-  L1_NextFailureTime    : DT;
+  L1_FailureThresholdMinutes : REAL;  (* sampled TRIANGULAR after each repair *)
+  L1_AccumulatedFillMinutes : REAL := 0.0;  (* counts ONLY active filling *)
   L1_FailureStart       : DT;
   L1_RepairEndTime      : DT;
   L1_FailureCount       : INT := 0;
@@ -1430,7 +1521,8 @@ VAR_GLOBAL
   L1_AffectedCount      : INT := 0;
   
   L2_Status             : (OPERATIONAL, FAILURE);
-  L2_NextFailureTime    : DT;
+  L2_FailureThresholdMinutes : REAL;  (* sampled TRIANGULAR after each repair *)
+  L2_AccumulatedFillMinutes : REAL := 0.0;  (* counts ONLY active filling *)
   L2_FailureStart       : DT;
   L2_RepairEndTime      : DT;
   L2_FailureCount       : INT := 0;
@@ -1546,7 +1638,12 @@ END_VAR
 
 5. **Event Publishing**: Implement event buffer; flush to Kepware on threshold (e.g., every 100 events or 10 seconds).
 
-6. **Failure Randomness**: MTTF now sampled from TRIANGULAR(7500, 9000, 10500); no periodic fixed failures.
+6. **Failure Timing - CRITICAL**: Failures accumulate ONLY during active filling, NOT wall-clock time.
+   - Use `L1_AccumulatedFillMinutes` and `L2_AccumulatedFillMinutes`
+   - Increment by 1/60 min per scan (1 second)
+   - Reset accumulator to 0 after each repair + failure trigger
+   - Check `HasActiveS3aFills()` and `HasActiveS3bFills()` helpers
+   - This ensures failures occur due to equipment stress, not idle time
 
 7. **Validation**: Compare final distributions against historical baselines within 5% tolerance.
 
