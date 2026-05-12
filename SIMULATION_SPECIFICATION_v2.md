@@ -152,10 +152,11 @@ TruckEntity:
   
   -- Service metrics --
   FillAmount             : REAL (liters) [S3]
+  RemainingFillAmount    : REAL (liters) [S3 tracking for pause/resume - resume uses this]
   ProductiveFillTime     : REAL (minutes) [S3 actual fill time excluding pauses]
   FailureDowntimeMinutes : REAL (minutes) [total pause time during S3 fill]
   DerivedFlowRate        : REAL (L/min) = FillAmount / ProductiveFillTime [S3]
-  GroundingStatus        : BOOL [always TRUE in v2]
+  GroundingStatus        : BOOL [always TRUE; no compliance violations in v1]
   
   -- Failure state --
   IsFailurePaused        : BOOL
@@ -281,14 +282,17 @@ For each hour H (0–23):
 
 ---
 
-### 2. Service Time Distributions (S1, S2, S4)
+### 2. Service Time Distributions (S1, S2, S4) - SERVICE TIMES ONLY
 
 **Data source**: Historical 2022 analysis  
 **Method**: SERVICE times derived from `EndTime - StartTime` in historical CSVs  
+**CRITICAL**: Distributions below are SERVICE TIMES, NOT queue wait times  
 **Semantics**:
-- `WaitTime = StartTime - ArrivalTime` (emerges from queue congestion)
-- `ServiceTime = EndTime - StartTime` (actual processing time - sampled below)
+- `WaitTime = StartTime - ArrivalTime` (emerges naturally from queue congestion, NOT sampled)
+- `ServiceTime = EndTime - StartTime` (actual processing time - SAMPLED FROM DISTRIBUTIONS BELOW)
 - `StationElapsed = DepartureTime - ArrivalTime`
+
+**Implementation rule**: Sample service time distributions directly; do NOT add them to wait time.
 
 #### S1 (SALES OFFICE) Service Time
 
@@ -415,23 +419,27 @@ ProductiveFillTime := TRIANGULAR(38, 42, 46)  // minutes
 
 ---
 
-### 6. Derived Flow Rate (S3)
+### 6. Derived Flow Rate (S3) - WITH FAILURE DOWNTIME EXCLUSION
 
-**NOT independently generated; derived from fill and time**
+**NOT independently generated; derived from fill and productive time**
 
 **Formula**:
 ```
+ProductiveFillTime := ElapsedFillWindow - FailureDowntimeMinutes
+// ElapsedFillWindow = fill_end_time - fill_start_time (total time between start and end)
+// FailureDowntimeMinutes = accumulated pause time during filling (if any)
+
 DerivedFlowRate := FillAmount / ProductiveFillTime  [L/min]
 ```
 
-**Failure adjustment**:
-If truck experienced failure pause during filling:
-```
-AdjustedFlowRate := FillAmount / ProductiveFillTime
-// (ProductiveFillTime already excludes pause; pause tracked separately in FailureDowntimeMinutes)
-```
+**Example**:
+- Fill started: 08:00, Fill ended: 08:42 (42 min elapsed)
+- Failure pause: 10 min (during filling)
+- Productive fill time: 42 - 10 = 32 min
+- Fill amount: 9,600 L
+- Flow rate: 9,600 / 32 = 300 L/min
 
-**Validation**: Historically, median ~220 L/min (both products).
+**Validation**: Historically, median ~220 L/min (both products) when no failures occur.
 
 ---
 
@@ -444,8 +452,8 @@ AdjustedFlowRate := FillAmount / ProductiveFillTime
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | MTTF Mean | 150 hours = 9,000 minutes | Expected mean |
-| MTTF Distribution | TRIANGULAR(7500, 9000, 10500) min | ±1500 min variance |
-| MTTR | 120 minutes (fixed) | Repair time always 2 hours |
+| MTTF Distribution | TRIANGULAR(7500, 9000, 10500) min | ±1500 min variance; **SAMPLED AFTER EACH REPAIR** |
+| MTTR | 120 minutes (FIXED) | **Repair time always exactly 2 hours, not sampled** |
 
 **CODESYS logic**:
 ```
@@ -469,7 +477,10 @@ if L1_Status == FAILURE:
     for each paused truck:
       truck.IsFailurePaused := FALSE
       truck.FailurePauseEnd := now
-      truck.FailureDowntimeMinutes += (truck.FailurePauseEnd - truck.FailurePauseStart)
+      PauseDuration := (truck.FailurePauseEnd - truck.FailurePauseStart) in minutes
+      truck.FailureDowntimeMinutes += PauseDuration
+      truck.RemainingFillAmount := truck.FillAmount  (* resume from full amount, not reduced *)
+      // Continue filling from current time until RemainingFillAmount reached at historical flow rate
 ```
 
 #### Gasohol95 Line (L2)
@@ -649,17 +660,17 @@ FOR each line in {L1, L2}:
 ## OUTPUT FILES & SCHEMAS
 
 ### File 1: db_truck.csv
-**Purpose**: Master vehicle registry (static, written once at end)  
-**One row per unique vehicle that appeared in simulation**
+**Purpose**: Trip/Order event log (one row per truck visit to facility)  
+**One row per truck arrival (matches historical event-level format)**
 
 | Column | Type | Example | Notes |
 |--------|------|---------|-------|
-| vehicle_id | INT | 1 | Unique 1..160 |
-| company_id | INT | 3 | 1..30 |
+| po_number | INT | 200000001 | Shipment ID |
 | vehicle_number | STRING | สค.70-1234 | Thai plate format |
-| fleet_tier | STRING | ROYAL or NORMAL | |
-| total_trips | INT | 15 | Count in simulation |
-| last_exit_time | TIMESTAMP | 2026-03-31 18:30:00 | Final departure |
+| company_id | INT | 3 | 1..30 |
+| sold_to | STRING | Customer Name | Destination |
+| arrival_time | TIMESTAMP | 2026-03-01 06:30:00 | Facility entry |
+| product_type | STRING | DIESEL or GASOHOL95 | Fuel type |
 
 ---
 
