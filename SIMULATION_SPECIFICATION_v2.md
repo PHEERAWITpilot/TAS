@@ -156,7 +156,7 @@ TruckEntity:
   ProductiveFillTime     : REAL (minutes) [S3 actual fill time excluding pauses]
   FailureDowntimeMinutes : REAL (minutes) [total pause time during S3 fill]
   DerivedFlowRate        : REAL (L/min) = FillAmount / ProductiveFillTime [S3]
-  GroundingStatus        : BOOL [always TRUE; no compliance violations in v1]
+  GroundingStatus        : BOOL [FALSE until grounding completes; TRUE from S3_FillStartTime onward]
   
   -- Failure state --
   IsFailurePaused        : BOOL
@@ -204,20 +204,42 @@ CompanyMaster:
    ↓
 [IN_S2] ← S2 processing (arrival → start → end → departure)
    ↓
-[QUEUED_S3] ← waiting for bay slot
+[QUEUED_S3] ← waiting for bay slot (GroundingStatus = FALSE)
    ↓
-[GROUNDING] ← safety grounding period (start → fill_start)
-   ↓
-[FILLING] ← active fuel transfer (fill_start → fill_end)
+[GROUNDING] ← safety grounding period in progress (GroundingStatus = FALSE)
+   ↓ [grounding_time elapsed]
+[FILLING] ← active fuel transfer; GroundingStatus becomes TRUE at fill_start
    ↓ [if failure during filling]
-[FILLING_PAUSED] ← fault pause, resume later
+[FILLING_PAUSED] ← fault pause, resume from remaining fill amount (GroundingStatus = TRUE)
+   ↓ [repair completes]
+[FILLING_RESUMED] ← continue to completion (GroundingStatus = TRUE)
    ↓
 [IN_S4] ← S4 processing (arrival → start → end → departure)
    ↓
 [IN_O1] ← exit gate (arrival → immediate departure)
    ↓
-[DEPARTED] ← left facility
+[DEPARTED] ← left facility (GroundingStatus = TRUE in historical record)
 ```
+
+**GroundingStatus State Transitions (DETAIL)**:
+```
+S3_ArrivalTime (truck enters queue)
+  GroundingStatus := FALSE  (not grounded yet)
+  
+S3_GroundingStartTime (grounding begins)
+  GroundingStatus := FALSE  (grounding in progress, not yet complete)
+  
+S3_FillStartTime = S3_GroundingStartTime + grounding_time
+  GroundingStatus := TRUE  (grounding now locked; fill safe)
+  
+S3_FillEndTime (and beyond, including pauses/resumes)
+  GroundingStatus := TRUE  (remains TRUE; compliance maintained)
+```
+
+**Output Records**:
+- CSV rows only appear AFTER truck completes station
+- S3a/S3b records always have `GroundingStatus = TRUE` (because truck only fills after grounding)
+- No truck skips grounding in v1 (no violations)
 
 ### Line Failure State (LINE-LEVEL)
 
@@ -734,13 +756,14 @@ FOR each line in {L1, L2}:
 | arrival_time | TIMESTAMP | 2026-03-01 10:30:00 | Entered S3b queue |
 | start_time | TIMESTAMP | 2026-03-01 10:45:00 | Grounding began |
 | grounding_time | REAL | 4.10 | minutes, TRIANGULAR(3,4,6) |
-| fill_start | TIMESTAMP | 2026-03-01 10:49:06 | Fuel flow began |
+| fill_start | TIMESTAMP | 2026-03-01 10:49:06 | Fuel flow began; GroundingStatus becomes TRUE |
 | end_time | TIMESTAMP | 2026-03-01 11:31:00 | Transfer complete |
 | departure_time | TIMESTAMP | 2026-03-01 11:31:00 | Left bay |
 | fill_amount | REAL | 9635 | liters, TRIANGULAR(6000,9635,11000) |
 | productive_fill_time | REAL | 41.9 | minutes (excluding pause time) |
 | failure_downtime_mins | REAL | 0.0 | Total pause due to line failure |
 | average_flow_rate | REAL | 230.02 | L/min = fill_amount / productive_fill_time |
+| grounding_status | BOOL | TRUE | Always TRUE in output (no truck fills without grounding) |
 
 ---
 
@@ -1008,10 +1031,11 @@ TYPE TruckEntity :
     S3_FillEndTime        : DT;
     S3_DepartureTime      : DT;
     S3_FillAmount         : REAL;       (* liters *)
+    S3_RemainingFillAmount: REAL;       (* liters, for pause/resume tracking *)
     S3_ProductiveFillTime : REAL;       (* minutes, excluding pause *)
     S3_FailureDowntimeMin : REAL;       (* accumulated pause minutes *)
     S3_DerivedFlowRate    : REAL;       (* L/min *)
-    S3_GroundingStatus    : BOOL;
+    S3_GroundingStatus    : BOOL;       (* FALSE until fill_start; TRUE from fill_start onward *)
     
     (* S4 Timestamps *)
     S4_ArrivalTime        : DT;
